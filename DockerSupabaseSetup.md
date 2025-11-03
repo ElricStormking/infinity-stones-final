@@ -347,6 +347,3 @@ docker logs infinity-storm-server --tail=200 -f
 - Login: `http://127.0.0.1:3000/test-player-login.html`
 - Admin: `http://127.0.0.1:3000/admin/test-dashboard`
 - Supabase Studio: `http://127.0.0.1:54323`
-
-Source: `https://github.com/ElricStormking/infinity-stones-production`
-

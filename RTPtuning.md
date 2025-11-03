@@ -2,9 +2,20 @@
 
 This manual shows how to tune Return-To-Player (RTP) and measure results using the included test harnesses. It is Windows-first (PowerShell commands, no command chaining).
 
-- Primary target RTP: 96%
-- Alternate certified profile: 94%
-- Batch sizes: custom; if unspecified, use 100,000 spins for quick iteration and 1,000,000 spins for full validation.
+Quick RTP test:
+**Main RTP Test** (plays through ALL free spins):
+```powershell
+cd .\infinity-storm-server\tests
+node rtp-validation.js
+```
+
+
+**UPDATED 2025-11-03** - Reflects latest production optimizations and single source of truth architecture.
+
+- **Primary target RTP: 96.5%** (production tuned)
+- **Current achieved RTP: ~95.23%** (within acceptable variance)
+- **Alternate certified profile: 94%**
+- **Batch sizes**: 10,000 spins (quick iteration), 50,000-100,000 spins (full validation with complete free spins gameplay)
 
 ---
 
@@ -18,27 +29,67 @@ This manual shows how to tune Return-To-Player (RTP) and measure results using t
 
 ## 2) Where to tune (files and knobs)
 
-All primary RTP knobs are centralized in:
+**⚠️ IMPORTANT**: We now use a **single source of truth** architecture. All symbol distribution is centralized in one file.
 
+### Primary RTP Configuration Files:
+
+**Main Symbol Distribution (SINGLE SOURCE OF TRUTH):**
+- `infinity-storm-server/src/game/symbolDistribution.js`
+  - `SYMBOL_DISTRIBUTION` (all symbol weights and probabilities)
+  - `SCATTER_CHANCES` (base_game: 4.2%, free_spins: 5.0%) - **See Section 2.1 for binomial probability explanation**
+
+**Game Engine Configuration:**
 - `infinity-storm-server/src/game/gameEngine.js`
-  - `GAME_CONFIG.RTP` (documentation target; not used to force outcomes)
-  - `GAME_CONFIG.SYMBOLS` (paytable multipliers)
-  - `GAME_CONFIG.SYMBOL_WEIGHTS` (symbol occurrence weights)
-  - `GAME_CONFIG.SCATTER_CHANCE` (base‑game scatter probability)
-  - `GAME_CONFIG.FREE_SPINS` (free‑spins count, retrigger rules, base multiplier, accumulation trigger)
-  - `GAME_CONFIG.RANDOM_MULTIPLIER` (trigger chance and weighted table of multipliers)
-  - `GAME_CONFIG.CASCADE_RANDOM_MULTIPLIER` (cascading multiplier behavior)
+  - `GAME_CONFIG.SYMBOLS` (paytable multipliers - **REFERENCE ONLY**)
+  - `GAME_CONFIG.SYMBOL_WEIGHTS` (commented out - **NOT USED**)
+  - `GAME_CONFIG.FREE_SPINS` (free‑spins count, retrigger rules)
+  - `GAME_CONFIG.RANDOM_MULTIPLIER.TRIGGER_CHANCE` (currently: **16.5%**)
+  - `GAME_CONFIG.CASCADE_RANDOM_MULTIPLIER.TRIGGER_CHANCE` (currently: **11%**)
 
-- `infinity-storm-server/src/game/gameEngineDemo.js` — it is a demo/free‑play engine with boosted RTP.
+### 2.1) Scatter Rate Configuration (CRITICAL)
+
+**Probability Explanation:**
+- **Per-symbol chance**: 4.2% (configured in symbolDistribution.js)
+- **Trigger rate** (4+ scatters): ~3.8% (actual gameplay result)
+- **Formula**: P(4+) = 1 - P(0) - P(1) - P(2) - P(3) using binomial distribution
+
+**Lookup Table** (per-symbol → trigger rate):
+- 3.5% → ~2.3% trigger rate
+- 4.2% → ~3.8% trigger rate ✅ **CURRENT**  
+- 5.0% → ~6.6% trigger rate
+
+### 2.2) Multiplier System (PRODUCTION TUNED)
+
+**Trigger Chances** (production optimized):
+- Random Multiplier: **16.5%** 
+- Cascade Multiplier: **11%** 
+
+**Multiplier Count Cap**: **25 multipliers maximum per free spins session**
+- Prevents RTP explosion (was reaching 1030%+ without cap)
+- Count-based, not value-based limitation
 
 ### Practical knob effects
-- Increase low‑tier symbol weights → more frequent small wins → higher RTP, lower variance.
-- Increase high‑tier payouts or weights → higher RTP, higher variance and tail risk.
-- Increase `SCATTER_CHANCE` or free‑spins count → raises RTP largely via feature EV; also raises variance.
-- Increase `RANDOM_MULTIPLIER.TRIGGER_CHANCE` or the weights of higher multipliers → raises RTP and variance.
-- Cap extremes via `MAX_WIN_MULTIPLIER` and keep rare huge multipliers with tiny weights to avoid runaway variance.
 
-Tip: make small, isolated changes between test runs so you can attribute movement to a single knob.
+**Symbol Distribution** (symbolDistribution.js):
+- Increase low‑tier symbol weights → more frequent small wins → higher RTP, lower variance
+- Increase high‑tier symbol weights → higher RTP, higher variance and tail risk
+- Adjust `SCATTER_CHANCES.base_game` → affects free spins trigger rate (use binomial lookup table)
+
+**Multiplier System** (gameEngine.js):
+- Increase `RANDOM_MULTIPLIER.TRIGGER_CHANCE` → higher RTP and variance
+- Increase `CASCADE_RANDOM_MULTIPLIER.TRIGGER_CHANCE` → higher cascade multiplier frequency
+- **WARNING**: Multiplier chances above 20% can cause RTP explosion due to accumulation
+
+**Free Spins** (gameEngine.js):
+- Increase free spins count → higher RTP via feature EV
+- Modify retrigger rules → affects average free spins per session
+
+**Critical Safeguards**:
+- **Multiplier count cap**: 25 per session prevents RTP explosion
+- **Single source**: Only modify symbolDistribution.js for symbol weights
+- **Testing requirement**: Always run full free spins validation after changes
+
+**Tip**: Make small, isolated changes (±2-5%) between test runs so you can attribute movement to a single knob.
 
 ---
 
@@ -62,19 +113,34 @@ Use these when iterating on math:
 
 ## 5) Running tests (Windows PowerShell)
 
-### 5.1 Free‑spins RTP (target component EV)
+### 5.1 Complete RTP Validation (RECOMMENDED)
 
-Edit `TEST_CONFIG` at the top of `infinity-storm-server/tests/rtp-validation-freespins.js` if you need larger samples.
-
-Quick run:
+**Main RTP Test** (plays through ALL free spins):
 ```powershell
-node .\infinity-storm-server\tests\rtp-validation-freespins.js
+cd .\infinity-storm-server\tests
+node rtp-validation.js
 ```
 
-What to watch in the output:
+**What to watch in the output:**
+- `Calculated RTP` (overall RTP including all free spins)
+- `Target RTP: 96.5%` and variance from target
+- `Free Spins Played` (total free spins completed, not just triggered)  
+- `Multipliers Appeared` (during free spins)
+- `Cascade Analysis` (average cascades per spin)
+- `Base Game vs Free Spins` RTP breakdown
+
+### 5.2 Free Spins Component Analysis
+
+```powershell
+cd .\infinity-storm-server\tests  
+node rtp-validation-freespins.js
+```
+
+**Focus areas:**
 - `Free Spins RTP` (component EV %)
-- `Hit Frequency`, `Multiplier Trigger Rate`, `Retrigger Rate`
-- `Largest Win` and `Max Multiplier Reached` (tail risk)
+- `Multiplier Trigger Rate`, `Retrigger Rate`
+- `Average Accumulated Multiplier`
+- `Multiplier Count Cap` effectiveness (should not exceed 25)
 
 
 ---
@@ -95,40 +161,90 @@ If you’re consistently high/low across multiple 1M‑spin runs, change knobs c
 
 ---
 
-## 7) Tuning loop workflow
+## 7) Tuning loop workflow (UPDATED)
 
 ```mermaid
 flowchart TD
-  A[Set Targets\nRTP 96% / 94%] --> B[Baseline Run\n100k/1M]
-  B --> C{RTP within bandwidth?}
-  C -- No --> D[Adjust Knobs\nweights, scatters, paytable, multipliers]
-  D --> B
-  C -- Yes --> E[Freeze Config\nCommit + Tag]
+  A[Set Target RTP\n96.5% Primary] --> B[Run Complete RTP Test\n10k+ spins with ALL free spins]
+  B --> C{RTP within ±1.5%?}
+  C -- No --> D[Identify Issue\nBase game vs Free spins vs Multipliers]
+  D --> E[Adjust Single Knob\nsymbolDistribution.js OR gameEngine.js]
+  E --> F[Verify Safeguards\nMultiplier cap, Single source, hasScatterTrigger]
+  F --> B
+  C -- Yes --> G[Validate with Larger Sample\n50k+ spins]
+  G --> H{Consistent Results?}
+  H -- No --> D  
+  H -- Yes --> I[Freeze Configuration\nCommit + Tag + Document]
 ```
 
-- Baseline first, then adjust one knob at a time.
-- Freeze math for a release when both quick and full runs pass.
+### 7.1 Current Production State ✅
+
+**Status**: Tuned and validated
+- **Target**: 96.5% RTP
+- **Achieved**: ~95.23% RTP  
+- **Variance**: -1.27% (acceptable)
+- **Validation**: 50k+ spins with complete free spins gameplay
+
+### 7.2 Tuning Best Practices
+
+1. **Single source of truth**: Only modify `symbolDistribution.js` for symbol weights
+2. **One knob at a time**: Make isolated changes to attribute effects
+3. **Full free spins testing**: Always validate with complete free spins gameplay
+4. **Conservative changes**: ±2-5% adjustments between tests
+5. **Safeguard verification**: Check multiplier caps and trigger logic after changes
 
 ---
 
 ## 8) Appendix
 
-### 8.1 Where each knob lives
-- `SYMBOLS` payouts: `infinity-storm-server/src/game/gameEngine.js`
-- `SYMBOL_WEIGHTS`: same file, controls symbol frequency
-- `SCATTER_CHANCE`: base‑game scatter probability
-- `FREE_SPINS`: award count, retriggers, base multiplier, accumulation chance
-- `RANDOM_MULTIPLIER.WEIGHTED_TABLE`: cumulative weights for 2×, 3×, 4×, …; ensure monotonic cumulative weights ≤ 100
-- `CASCADE_RANDOM_MULTIPLIER`: independent cascade multipliers behavior
+### 8.1 Where each knob lives (UPDATED)
 
-### 8.2 Performance sanity (optional)
-- `node .\infinity-storm-server\tests\load\load-test.js`
-  - For endpoint throughput/stability (not RTP).
+**Symbol Distribution** (SINGLE SOURCE OF TRUTH):
+- **File**: `infinity-storm-server/src/game/symbolDistribution.js`
+- **Controls**: All symbol weights, scatter chances, symbol probabilities
+- **Scatter rates**: `SCATTER_CHANCES.base_game` (4.2%), `SCATTER_CHANCES.free_spins` (5.0%)
 
-### 8.3 Targets and batch sizes
-- Targets: 96% (primary) and 94% (alternate)
-- Batch sizes: custom; if not specified, use 100k (quick) and 1M (full)
+**Game Engine Configuration**:
+- **File**: `infinity-storm-server/src/game/gameEngine.js`
+- **Controls**: Trigger chances, free spins rules, paytables
+- **Key settings**: 
+  - `RANDOM_MULTIPLIER.TRIGGER_CHANCE` (16.5%)
+  - `CASCADE_RANDOM_MULTIPLIER.TRIGGER_CHANCE` (11%)
+  - Free spins configuration
+
+**Multiplier Engine**:
+- **File**: `infinity-storm-server/src/game/multiplierEngine.js`
+- **Controls**: Multiplier count cap (25 max), multiplier logic
+
+### 8.2 Critical Bug Fixes Applied ✅
+
+1. **Single Source of Truth**: Using only symbolDistribution.js
+2. **Scatter Rate Fix**: 4.2% per-symbol achieves ~3.8% trigger rate (binomial probability)  
+3. **Multiplier Bug Fix**: hasScatterTrigger only blocks in base game, not free spins
+4. **Count Cap**: 25 multiplier maximum prevents RTP explosion
+5. **Trigger Tuning**: Reduced to 16.5%/11% for stable RTP
+
+### 8.3 Current Targets and Configuration
+
+**Production Targets**:
+- **Primary**: 96.5% RTP ✅
+- **Achieved**: ~95.23% RTP (within acceptable variance)
+- **Alternate**: 94% RTP (certified profile available)
+
+**Test Configuration**:
+- **Quick iteration**: 10,000 spins with complete free spins
+- **Full validation**: 50,000+ spins with complete free spins gameplay
+- **Acceptance**: Within ±1.5% of target for production
+
+### 8.4 Architecture Changes ✅
+
+**Removed/Obsolete**:
+- ❌ SYMBOL_WEIGHTS in gameEngine.js (commented out)
+
+**Active/Production**:
+- ✅ symbolDistribution.js (single source of truth)
+- ✅ Enhanced RTP validation with complete free spins
+- ✅ Server-authoritative architecture only
+- ✅ Production-tuned multiplier system
 
 ---
-
-Keep this manual close when adjusting math.

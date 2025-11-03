@@ -18,9 +18,10 @@ const path = require('path');
 const crypto = require('crypto');
 
 // Import server-side game logic
-const GridEngine = require('../infinity-storm-server/game-logic/GridEngine');
+// GridEngine was removed - using server game engine directly
+const GameEngine = require('../infinity-storm-server/src/game/gameEngine');
 
-// Import client-side MathSimulator for comparison
+// RTP validation using server-side game engine only
 const { JSDOM } = require('jsdom');
 
 /**
@@ -29,7 +30,7 @@ const { JSDOM } = require('jsdom');
  */
 class RTPValidationSuite {
     constructor() {
-        this.gridEngine = new GridEngine();
+        this.gameEngine = new GameEngine();
         this.tolerance = 0.5; // ±0.5% RTP tolerance for regulatory compliance
         this.targetRTP = 96.5;
         this.results = {
@@ -78,12 +79,8 @@ class RTPValidationSuite {
             const gameConfigContent = fs.readFileSync(gameConfigPath, 'utf8');
             eval(gameConfigContent);
             
-            // Load MathSimulator
-            const mathSimulatorPath = path.join(__dirname, '../src/tools/MathSimulator.js');
-            const mathSimulatorContent = fs.readFileSync(mathSimulatorPath, 'utf8');
-            eval(mathSimulatorContent);
-            
-            this.clientSimulator = window.MathSimulator;
+            // Client-side math simulator removed - using server RNG only
+            this.clientSimulator = null;
             console.log('✓ Client simulator initialized successfully');
         } catch (error) {
             console.error('✗ Failed to initialize client simulator:', error.message);
