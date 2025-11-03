@@ -117,7 +117,57 @@ Notes:
 
 ---
 
-## 4) Build the client bundle to `/dist`
+## 4) Redis Setup with Docker
+
+### Quick Redis Start (Fix Login Session Errors)
+
+If you encounter login failures with `SESSION_CREATION_ERROR` or Redis authentication issues, start Redis using Docker:
+
+```powershell
+# Navigate to server directory
+cd D:\infinity-gauntlet\infinity-storm-server
+
+# Start only Redis container
+docker-compose up redis -d
+
+# Verify Redis is running
+docker-compose ps
+docker-compose logs redis
+```
+
+**Redis Configuration:**
+- Host: `localhost` (127.0.0.1)
+- Port: `6379`
+- Password: `infinity_redis_dev`
+- Container name: `infinity_redis`
+
+**Test Redis Connection:**
+```powershell
+docker exec -it infinity_redis redis-cli -a infinity_redis_dev ping
+```
+Should return `PONG` if working correctly.
+
+**Your `.env` should have:**
+```dotenv
+SKIP_REDIS=false
+REDIS_HOST=127.0.0.1
+REDIS_PORT=6379
+REDIS_PASSWORD=infinity_redis_dev
+```
+
+After starting Redis, restart your game server and login should work without session errors.
+
+### Alternative: Standalone Redis Container
+
+If the docker-compose method doesn't work:
+
+```powershell
+docker run -d --name redis -p 6379:6379 redis:7-alpine redis-server --requirepass infinity_redis_dev
+```
+
+---
+
+## 5) Build the client bundle to `/dist`
 
 You can rely on the Docker multi-stage build, or build locally for quick iteration:
 
@@ -131,7 +181,7 @@ Confirm `dist/` exists at repo root.
 
 ---
 
-## 5) Start Supabase locally
+## 6) Start Supabase locally
 
 From `infinity-storm-server/` (where `supabase/config.toml` resides):
 
@@ -185,7 +235,7 @@ psql "host=127.0.0.1 port=54322 user=postgres password=postgres dbname=postgres"
 
 ---
 
-## 6) Configure Docker Compose
+## 7) Configure Docker Compose
 
 Edit `infinity-storm-server/docker-compose.production.yml` for local dev:
 
@@ -199,7 +249,7 @@ Edit `infinity-storm-server/docker-compose.production.yml` for local dev:
 
 ---
 
-## 7) Build and run the server
+## 8) Build and run the server
 
 ```powershell
 
@@ -228,7 +278,7 @@ docker compose -f docker-compose.production.yml build --no-cache infinity-storm
 
 ---
 
-## 8) Verify locally
+## 9) Verify locally
 
 - Health: `http://127.0.0.1:3000/health`
 - Login page: `http://127.0.0.1:3000/test-player-login.html`
@@ -239,7 +289,7 @@ If you drop to demo mode, check DevTools for 401 and confirm `/api/auth/validate
 
 ---
 
-## 9) Troubleshooting quick refs
+## 10) Troubleshooting quick refs
 
 - Port 3000 taken: stop the conflicting process and rerun compose
 - HTTPS redirects locally: clear browser HSTS; ensure `FORCE_HTTPS=false`
@@ -247,13 +297,13 @@ If you drop to demo mode, check DevTools for 401 and confirm `/api/auth/validate
 - 429 on spins: loopback is exempted locally; hard reload to ensure updated JS
 - 401 after login: clear localStorage, ensure token persisted; verify `/api/auth/validate`
 - DB SSL error: for local set `PGSSLMODE=disable`, for Supabase Cloud `require`
-- Redis errors: ensure `redis` service running; `docker ps` and `docker logs`
+- Redis errors: start with `docker-compose up redis -d`; ensure authentication matches .env password
 - Missing `/dist`: run `npm run build` or rebuild image `--no-cache`
 - Browser caching old JS: Ctrl+F5 (server sends no-cache in dev)
 
 ---
 
-## 10) Online deployment (production)
+## 11) Online deployment (production)
 
 Recommended: Supabase Cloud + VM with Docker Compose behind Nginx and TLS.
 
@@ -312,7 +362,7 @@ docker compose -f docker-compose.production.yml up -d
 
 ---
 
-## 11) Production checklist (tighten everything)
+## 12) Production checklist (tighten everything)
 
 See `production_Ready_Skipped.md` and ensure:
 
@@ -324,7 +374,7 @@ See `production_Ready_Skipped.md` and ensure:
 
 ---
 
-## 12) Appendix
+## 13) Appendix
 
 ### Handy PowerShell
 
