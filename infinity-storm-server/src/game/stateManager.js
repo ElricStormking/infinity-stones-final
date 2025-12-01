@@ -457,11 +457,18 @@ class StateManager {
      * @returns {Object} State updates to apply
      */
   calculateStateUpdates(currentState, spinResult) {
+    // CRITICAL: Track if this spin WAS a free spin (before decrementing)
+    // This is important because isInFreeSpins() checks remaining > 0, which fails on the last spin
+    const wasInFreeSpins = currentState.game_mode === 'free_spins';
+    const wasProcessingFreeSpinsSpin = wasInFreeSpins || (currentState.free_spins_remaining > 0);
+    
     console.log('🎰 STATE MANAGER: calculateStateUpdates called for player', {
       playerId: currentState.player_id,
       gameMode: currentState.game_mode,
       freeSpinsRemaining: currentState.free_spins_remaining,
       currentAccumulated: currentState.accumulated_multiplier,
+      wasInFreeSpins,
+      wasProcessingFreeSpinsSpin,
       hasSpinResult: !!spinResult,
       hasBonusFeatures: !!spinResult.bonusFeatures,
       hasRandomMultipliers: spinResult.bonusFeatures?.randomMultipliers?.length || 0
@@ -469,35 +476,9 @@ class StateManager {
 
     const updates = {};
 
-    // Handle free spins mode
-    if (currentState.isInFreeSpins()) {
-      updates.free_spins_remaining = Math.max(0, currentState.free_spins_remaining - 1);
-
-      // Check if free spins are ending
-      if (updates.free_spins_remaining === 0) {
-        updates.game_mode = 'base';
-        updates.accumulated_multiplier = 1.00;
-      }
-    }
-
-    // Handle free spins trigger
-    if (spinResult.features?.free_spins) {
-      updates.game_mode = 'free_spins';
-      updates.free_spins_remaining = spinResult.features.free_spins.count;
-      updates.accumulated_multiplier = spinResult.features.free_spins.multiplier || 1.00;
-    }
-
-    // Handle multiplier updates during free spins
-    // Check for new accumulated multiplier from game engine (includes all random multipliers from this spin)
-    console.log('🎰 STATE MANAGER: Checking accumulated multiplier update:', {
-      isInFreeSpins: currentState.isInFreeSpins(),
-      hasNewAccumulatedMultiplier: typeof spinResult.newAccumulatedMultiplier === 'number',
-      newAccumulatedMultiplierValue: spinResult.newAccumulatedMultiplier,
-      currentAccumulated: currentState.accumulated_multiplier,
-      randomMultipliersCount: spinResult.bonusFeatures?.randomMultipliers?.length || 0
-    });
-
-    if (currentState.isInFreeSpins() && typeof spinResult.newAccumulatedMultiplier === 'number') {
+    // STEP 1: Handle multiplier updates FIRST (before decrementing free spins)
+    // This ensures the accumulated multiplier from this spin is captured even on the last spin
+    if (wasProcessingFreeSpinsSpin && typeof spinResult.newAccumulatedMultiplier === 'number') {
       // Use the game engine's calculated accumulated multiplier (includes current spin's multipliers)
       updates.accumulated_multiplier = spinResult.newAccumulatedMultiplier;
       console.log('🎰 STATE MANAGER: ✅ Updating accumulated multiplier:', {
@@ -505,7 +486,7 @@ class StateManager {
         after: spinResult.newAccumulatedMultiplier,
         randomMultipliers: spinResult.bonusFeatures?.randomMultipliers?.length || 0
       });
-    } else if (currentState.isInFreeSpins() && spinResult.multiplier) {
+    } else if (wasProcessingFreeSpinsSpin && spinResult.multiplier) {
       // Legacy fallback for single multiplier field
       updates.accumulated_multiplier = currentState.accumulated_multiplier + spinResult.multiplier;
       console.log('🎰 STATE MANAGER: ✅ Updating accumulated multiplier (legacy):', {
@@ -513,8 +494,52 @@ class StateManager {
         adding: spinResult.multiplier,
         after: updates.accumulated_multiplier
       });
+    } else if (wasProcessingFreeSpinsSpin) {
+      // Preserve current accumulated multiplier if no new multipliers this spin
+      updates.accumulated_multiplier = currentState.accumulated_multiplier;
+      console.log('🎰 STATE MANAGER: 📌 Preserving accumulated multiplier (no new multipliers):', currentState.accumulated_multiplier);
     } else {
-      console.log('🎰 STATE MANAGER: ❌ NOT updating accumulated multiplier (conditions not met)');
+      console.log('🎰 STATE MANAGER: ❌ NOT updating accumulated multiplier (not in free spins)');
+    }
+
+    // STEP 2: Handle free spins mode (decrement count)
+    if (wasProcessingFreeSpinsSpin) {
+      updates.free_spins_remaining = Math.max(0, currentState.free_spins_remaining - 1);
+
+      // Check if free spins are ending (AFTER capturing the multiplier)
+      if (updates.free_spins_remaining === 0) {
+        updates.game_mode = 'base';
+        // NOTE: We keep the accumulated_multiplier from this spin for the response,
+        // but it will be reset to 1 for the NEXT spin (this is handled in the response)
+        // Don't reset here - let the game controller handle the display vs next-spin logic
+      }
+    }
+
+    // STEP 3: Handle free spins trigger or retrigger
+    if (spinResult.features?.free_spins) {
+      const isRetrigger = spinResult.features.free_spins.retrigger === true;
+      
+      if (isRetrigger) {
+        // RETRIGGER: Add spins to remaining count, keep accumulated multiplier
+        // The count already includes remaining + awarded (calculated in gameEngine)
+        updates.game_mode = 'free_spins';
+        updates.free_spins_remaining = spinResult.features.free_spins.count;
+        // Don't reset multiplier on retrigger - keep the accumulated value
+        console.log('🎰 STATE MANAGER: FREE SPINS RETRIGGER - Adding spins:', {
+          newRemaining: spinResult.features.free_spins.count,
+          spinsAwarded: spinResult.features.free_spins.spinsAwarded,
+          keepingMultiplier: updates.accumulated_multiplier || currentState.accumulated_multiplier
+        });
+      } else {
+        // NEW TRIGGER: Start fresh free spins session
+        updates.game_mode = 'free_spins';
+        updates.free_spins_remaining = spinResult.features.free_spins.count;
+        updates.accumulated_multiplier = spinResult.features.free_spins.multiplier || 1.00;
+        console.log('🎰 STATE MANAGER: NEW FREE SPINS TRIGGER:', {
+          spinsAwarded: spinResult.features.free_spins.count,
+          startingMultiplier: updates.accumulated_multiplier
+        });
+      }
     }
 
     const currentStateData = currentState.state_data || {};
@@ -841,4 +866,19 @@ class StateManager {
   }
 }
 
+// Singleton instance for shared access across the application
+let stateManagerInstance = null;
+
+/**
+ * Get the singleton StateManager instance
+ * @returns {StateManager} The shared StateManager instance
+ */
+function getStateManager() {
+  if (!stateManagerInstance) {
+    stateManagerInstance = new StateManager();
+  }
+  return stateManagerInstance;
+}
+
 module.exports = StateManager;
+module.exports.getStateManager = getStateManager;

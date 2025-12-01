@@ -73,57 +73,54 @@ window.FreeSpinsManager = class FreeSpinsManager {
         // Note: Auto-play continues automatically, no need to restart it
     }
     
+    /**
+     * Show NEW free spins UI - called when server triggers new free spins session
+     * State is already synced from server - this only shows the UI
+     * @param {Number} spins - Number of spins awarded (for display)
+     */
+    showNewFreeSpinsUI(spins) {
+        const count = Number(spins) || 0;
+        if (count <= 0) {
+            return;
+        }
+        console.log(`🎰 SERVER triggered NEW free spins: ${count} spins (state already synced)`);
+        // Show the free spins start UI - state is already set by server sync
+        this.showThanosSnapThenStartUI(count, 'server');
+    }
+    
+    /**
+     * Legacy method - kept for compatibility
+     * @deprecated Use showNewFreeSpinsUI for new triggers, GameScene.showRetriggerAnimation for retriggers
+     */
     processFreeSpinsTrigger(spins, triggerType = 'server') {
         const count = Number(spins) || 0;
         if (count <= 0) {
             return;
         }
 
-        // Retrigger if already active
+        // If already active, this is a retrigger - but state is already synced from server
+        // Just show the UI, don't modify state
         if (this.scene.stateManager?.freeSpinsData?.active) {
-            // Get scatter positions for celebration during retrigger
-            const scatterPositions = this.scene.gridManager?.getScatterPositions?.() || [];
-            
-            // Play scatter celebration for retrigger if applicable
-            if (scatterPositions.length >= 4 && this.scene.scatterCelebration) {
-                console.log(`✨ Playing scatter celebration for server retrigger at ${scatterPositions.length} positions`);
-                this.scene.scatterCelebration.playAtPositions(scatterPositions, () => {
-                    // After celebration, add spins
-                    this.addFreeSpinsSpins(count);
-                    // Removed redundant "+5 Free Spins!" toast
-                    // Show animated +5 visual effect
-                    try {
-                        if (this.scene.uiManager.showFreeSpinsRetriggerAnimation) {
-                            this.scene.uiManager.showFreeSpinsRetriggerAnimation(count);
-                        } else {
-                            this.scene.uiManager.updateFreeSpinsDisplay?.();
-                        }
-                    } catch (_) {}
-                    window.SafeSound.play(this.scene, 'bonus');
-                });
-            } else {
-                // No celebration, proceed directly
-                this.addFreeSpinsSpins(count);
-                // Removed redundant "+5 Free Spins!" toast
-                // Show animated +5 visual effect
-                try {
-                    if (this.scene.uiManager.showFreeSpinsRetriggerAnimation) {
-                        this.scene.uiManager.showFreeSpinsRetriggerAnimation(count);
-                    } else {
-                        this.scene.uiManager.updateFreeSpinsDisplay?.();
-                    }
-                } catch (_) {}
-                window.SafeSound.play(this.scene, 'bonus');
-            }
+            console.log(`🎰 Retrigger detected in processFreeSpinsTrigger - showing animation only`);
+            // State already synced from server, just show retrigger animation
+            try {
+                if (this.scene.uiManager.showFreeSpinsRetriggerAnimation) {
+                    this.scene.uiManager.showFreeSpinsRetriggerAnimation(count);
+                } else {
+                    this.scene.uiManager.updateFreeSpinsDisplay?.();
+                }
+            } catch (_) {}
+            window.SafeSound.play(this.scene, 'bonus');
             return;
         }
 
-        // First-time trigger from server payload
+        // First-time trigger - show the start UI
         this.showThanosSnapThenStartUI(count, triggerType || 'server');
     }
 
     triggerFreeSpins(scatterCount) {
         // 4+ scatters always award 15 free spins in base game
+        // NOTE: This is legacy client-side detection - server should be authoritative
         const freeSpins = window.GameConfig.FREE_SPINS.SCATTER_4_PLUS;
         
         // Play Thanos finger snap animation + SFX, then show the Free Spins Start UI
@@ -151,8 +148,21 @@ window.FreeSpinsManager = class FreeSpinsManager {
     }
     
     async handleFreeSpinsEnd() {
-        // Check if free spins ended
-        if (this.scene.stateManager.freeSpinsData.active && this.scene.stateManager.freeSpinsData.count === 0) {
+        // Check if free spins ended - SERVER IS AUTHORITATIVE
+        // Server tells us via serverSaidFreeSpinsEnded flag (set in processServerSpinResult)
+        const serverSaidEnded = this.scene.serverSaidFreeSpinsEnded === true;
+        const isActive = this.scene.stateManager.freeSpinsData.active;
+        const count = this.scene.stateManager.freeSpinsData.count;
+        
+        console.log(`🎰 handleFreeSpinsEnd check: serverSaidEnded=${serverSaidEnded}, active=${isActive}, count=${count}`);
+        
+        // Clear the flag immediately to prevent double-triggering
+        if (serverSaidEnded) {
+            this.scene.serverSaidFreeSpinsEnded = false;
+        }
+        
+        // Server explicitly told us free spins ended
+        if (serverSaidEnded) {
             // If there are still FS shooting stars in flight, defer ending so plaque can finalize correctly
             if ((this.scene.fsPendingRMStars || 0) > 0) {
                 this.pendingFsEnd = true;

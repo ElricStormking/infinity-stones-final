@@ -42,32 +42,18 @@ window.NetworkService = new (class NetworkService {
             return;
         }
         
-        // FALLBACK 2: Check localStorage
-        const storedToken = localStorage.getItem('infinity_storm_token');
-        console.log(`🔐 [AUTH] Checking localStorage['infinity_storm_token']`);
+        // FALLBACK 2: Check localStorage (check both new and legacy keys)
+        const storedToken = localStorage.getItem('infinity_storm_token') || localStorage.getItem('authToken');
+        console.log(`🔐 [AUTH] Checking localStorage for token`);
         if (storedToken) {
-            // Require recent explicit intent flag to auto-use stored token
-            let explicitOk = false;
-            try {
-                const flag = localStorage.getItem('explicit_real') === '1';
-                const exp = parseInt(localStorage.getItem('explicit_real_expires') || '0', 10);
-                explicitOk = flag && exp > Date.now();
-            } catch (_) { explicitOk = false; }
-
-            if (explicitOk) {
-                this.authToken = storedToken;
-                console.log(`✅ [AUTH] Token loaded from localStorage: ${storedToken.substring(0, 30)}...`);
-                // Validate token on next tick to avoid blocking initialization
-                setTimeout(() => this.validateStoredToken(), 100);
-            } else {
-                console.warn('🔐 [AUTH] Stored token present but no recent explicit login flag; clearing');
-                try {
-                    localStorage.removeItem('infinity_storm_token');
-                    localStorage.removeItem('playerId');
-                    localStorage.removeItem('playerUsername');
-                } catch (_) {}
-                this.authToken = null;
-            }
+            // Use stored token if present - validate it with server on next tick
+            // The explicit_real flag is optional; if token is invalid, server will reject it
+            this.authToken = storedToken;
+            // Ensure token is stored under the canonical key
+            localStorage.setItem('infinity_storm_token', storedToken);
+            console.log(`✅ [AUTH] Token loaded from localStorage: ${storedToken.substring(0, 30)}...`);
+            // Validate token on next tick to avoid blocking initialization
+            setTimeout(() => this.validateStoredToken(), 100);
         } else {
             console.warn(`❌ [AUTH] No auth token found - will use demo mode`);
         }
@@ -193,7 +179,9 @@ window.NetworkService = new (class NetworkService {
             const result = await this.api.post('/api/auth/validate', { token: this.authToken }, {
                 headers: { Authorization: `Bearer ${this.authToken}` }
             });
-            if (!result.success) {
+            // axios response has data in result.data, not result directly
+            const data = result.data;
+            if (!data || !data.success) {
                 console.warn('[AUTH] Token validation failed - clearing token');
                 this.handleAuthError();
                 try { localStorage.removeItem('playerId'); localStorage.removeItem('playerUsername'); localStorage.removeItem('explicit_real'); localStorage.removeItem('explicit_real_expires'); } catch(_) {}

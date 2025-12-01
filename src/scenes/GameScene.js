@@ -579,6 +579,9 @@ window.GameScene = class GameScene extends Phaser.Scene {
                 console.log('⚠️ No response from getGameState');
                 return;
             }
+            
+            console.log('🔍 Server Response for GameState:', JSON.stringify(response));
+            
             const gameState = response.gameState || (response.data && response.data.gameState) || response.data || null;
             if (gameState) {
                 this.applyServerGameState(gameState, { source: 'initial-request', raw: response, initial: true });
@@ -601,21 +604,19 @@ window.GameScene = class GameScene extends Phaser.Scene {
                 balanceValue = response.gameState.credits;
             } else if (gameState && gameState.credits !== undefined) {
                 balanceValue = gameState.credits;
+            } else if (response.player && typeof response.player.credits === 'number') {
+                balanceValue = response.player.credits;
             }
             
-            console.log('🔍 Balance extraction result:', balanceValue, 'from response:', {
-                'response.balance': response.balance,
-                'response.data?.balance': response.data?.balance,
-                'gameState?.balance': gameState?.balance,
-                'gameState?.credits': gameState?.credits
-            });
-            
+            console.log('🔍 Balance extraction result:', balanceValue, 'from response keys:', Object.keys(response));
+
             if (typeof balanceValue === 'number') {
                 this.stateManager.setBalanceFromServer(balanceValue);
                 
                 // Sync WalletAPI so UI displays correct balance
                 if (window.WalletAPI) {
                     window.WalletAPI.setBalance(balanceValue);
+                    console.log('✅ WalletAPI updated to:', balanceValue);
                 }
                 
                 this.updateBalanceDisplay();
@@ -1251,9 +1252,12 @@ window.GameScene = class GameScene extends Phaser.Scene {
         this.input.enabled = false;
         
         // Place bet or use free spin
+        // NOTE: Server is authoritative for free spins count - we don't decrement locally
+        // Server will tell us the correct remaining count in the response
         if (this.stateManager.freeSpinsData.active) {
-            this.stateManager.useFreeSpins();
-            this.uiManager.updateFreeSpinsDisplay();
+            // Don't decrement locally - server will sync the correct count
+            console.log(`🎰 Starting free spin (server will update remaining count)`);
+            // UI will be updated when server response arrives
         } else {
             const balanceBefore = this.stateManager.gameData.balance;
             this.stateManager.placeBet();
@@ -2931,37 +2935,61 @@ window.GameScene = class GameScene extends Phaser.Scene {
                 }
             }
 
-            console.log(`🎰 FREE SPINS CHECK (client):`, {
-                freeSpinsAwarded: normalized.freeSpinsAwarded,
+            // ============================================================
+            // SERVER IS AUTHORITATIVE - Client only displays server state
+            // ============================================================
+            console.log(`🎰 SERVER FREE SPINS STATE:`, {
+                freeSpinsActive: normalized.freeSpinsActive,
+                freeSpinsRemaining: normalized.freeSpinsRemaining,
+                freeSpinsEnded: normalized.freeSpinsEnded,
                 freeSpinsTriggered: normalized.freeSpinsTriggered,
-                bonusFeaturesFreeSpinsAwarded: normalized?.bonusFeatures?.freeSpinsAwarded,
-                bonusFeaturesFreeSpinsTriggered: normalized?.bonusFeatures?.freeSpinsTriggered,
-                hasBonusFeatures: !!normalized.bonusFeatures
+                freeSpinsRetriggered: normalized.freeSpinsRetriggered,
+                freeSpinsAwarded: normalized.freeSpinsAwarded,
+                gameMode: normalized.gameMode
             });
             
-            // DISABLED CLIENT FALLBACKS - Server is authoritative!
-            // Only process free spins if server explicitly triggers them
-            if (normalized.freeSpinsAwarded) {
-                // Immediately lock mode switches as soon as server says FS will trigger
+            // STEP 1: Sync ALL free spins state from server (SERVER IS AUTHORITATIVE)
+            const serverFreeSpinsActive = normalized.freeSpinsActive || normalized.gameMode === 'free_spins';
+            const serverFreeSpinsRemaining = typeof normalized.freeSpinsRemaining === 'number' ? normalized.freeSpinsRemaining : 0;
+            const serverFreeSpinsEnded = normalized.freeSpinsEnded === true;
+            const serverFreeSpinsRetriggered = normalized.freeSpinsRetriggered === true;
+            const serverFreeSpinsTriggered = normalized.freeSpinsTriggered === true;
+            const serverFreeSpinsAwarded = normalized.freeSpinsAwarded || 0;
+            
+            // Update client state to match server (display only)
+            const wasActive = this.stateManager.freeSpinsData.active;
+            const oldCount = this.stateManager.freeSpinsData.count;
+            
+            this.stateManager.freeSpinsData.active = serverFreeSpinsActive;
+            this.stateManager.freeSpinsData.count = serverFreeSpinsRemaining;
+            
+            console.log(`🎰 CLIENT STATE SYNCED FROM SERVER: active: ${wasActive} → ${serverFreeSpinsActive}, count: ${oldCount} → ${serverFreeSpinsRemaining}`);
+            this.uiManager.updateFreeSpinsDisplay?.();
+            
+            // STEP 2: Handle UI display based on server decisions
+            // Server tells us what happened - we just display it
+            if (serverFreeSpinsTriggered && !wasActive) {
+                // NEW free spins trigger (was not in free spins, now entering)
+                console.log(`✅ SERVER TRIGGERED NEW FREE SPINS: ${serverFreeSpinsAwarded} spins`);
                 try { this.lockModeSwitches = true; this.uiManager?.updateModeSwitchButtonsState?.(); } catch (_) {}
-                console.log(`✅ Free spins triggered via normalized.freeSpinsAwarded: ${normalized.freeSpinsAwarded}`);
-                this.triggerFreeSpinsWithScatterCelebration(normalized.freeSpinsAwarded);
-            } else if (normalized.freeSpinsTriggered) {
-                // Server says free spins triggered but no award count came through
-                const award = normalized.bonusFeatures?.freeSpinsAwarded || window.GameConfig?.FREE_SPINS?.SCATTER_4_PLUS || 15;
+                this.triggerFreeSpinsWithScatterCelebration(serverFreeSpinsAwarded);
+            } else if (serverFreeSpinsRetriggered && wasActive) {
+                // RETRIGGER during free spins (server added spins, we just show animation)
+                console.log(`✅ SERVER RETRIGGERED FREE SPINS: +${serverFreeSpinsAwarded} spins, total remaining: ${serverFreeSpinsRemaining}`);
                 try { this.lockModeSwitches = true; this.uiManager?.updateModeSwitchButtonsState?.(); } catch (_) {}
-                console.log(`✅ Free spins triggered via normalized.freeSpinsTriggered: ${award}`);
-                this.triggerFreeSpinsWithScatterCelebration(award);
-            } else {
-                // Check bonusFeatures as fallback
-                const bfAward = normalized?.bonusFeatures?.freeSpinsAwarded;
-                if (typeof bfAward === 'number' && bfAward > 0) {
-                    try { this.lockModeSwitches = true; this.uiManager?.updateModeSwitchButtonsState?.(); } catch (_) {}
-                    console.log(`✅ Free spins triggered via bonusFeatures.freeSpinsAwarded: ${bfAward}`);
-                    this.triggerFreeSpinsWithScatterCelebration(bfAward);
-                } else {
-                    console.log(`❌ Free spins NOT triggered by server`);
+                // Show retrigger animation only - count already synced from server
+                this.showRetriggerAnimation(serverFreeSpinsAwarded);
+            } else if (serverFreeSpinsEnded && wasActive) {
+                // FREE SPINS ENDED - Server says free spins are complete
+                // Store this flag so endSpin() can trigger the final win presentation
+                console.log(`🏁 SERVER ENDED FREE SPINS - will show final win presentation`);
+                this.serverSaidFreeSpinsEnded = true;
+                // Sync the total win from server if provided
+                if (typeof normalized.freeSpinsTotalWin === 'number') {
+                    this.stateManager.freeSpinsData.totalWin = normalized.freeSpinsTotalWin;
                 }
+            } else {
+                console.log(`ℹ️ No free spins trigger/retrigger/end from server`);
             }
 
             // Set baseWinForFormula for all spins (with or without multipliers)
@@ -3156,10 +3184,58 @@ window.GameScene = class GameScene extends Phaser.Scene {
             console.log(`⚠️ Skipping scatter celebration (scatterCount: ${scatterCount}, hasEffect: ${!!this.scatterCelebration})`);
         }
         
-        // Now proceed with normal free spins trigger
-        if (this.freeSpinsManager && this.freeSpinsManager.processFreeSpinsTrigger) {
+        // Show the free spins start UI (NEW trigger only - state already synced from server)
+        if (this.freeSpinsManager && this.freeSpinsManager.showNewFreeSpinsUI) {
+            this.freeSpinsManager.showNewFreeSpinsUI(spinsAwarded);
+        } else if (this.freeSpinsManager && this.freeSpinsManager.processFreeSpinsTrigger) {
+            // Fallback to old method
             this.freeSpinsManager.processFreeSpinsTrigger(spinsAwarded);
         }
+    }
+    
+    /**
+     * Show retrigger animation only - state is already synced from server
+     * Does NOT modify free spins count - server already set the correct value
+     * @param {Number} spinsAwarded - Number of spins added by retrigger (for display only)
+     */
+    showRetriggerAnimation(spinsAwarded) {
+        console.log(`🎰 Showing retrigger animation for +${spinsAwarded} spins (state already synced from server)`);
+        
+        // Get scatter positions for celebration
+        const scatterPositions = this.gridManager?.getScatterPositions?.() || [];
+        
+        // Play scatter celebration if applicable
+        if (scatterPositions.length >= 4 && this.scatterCelebration) {
+            this.scatterCelebration.playAtPositions(scatterPositions, () => {
+                // After celebration, show the retrigger visual effect
+                this.displayRetriggerEffect(spinsAwarded);
+            });
+        } else {
+            // No celebration, show retrigger effect directly
+            this.displayRetriggerEffect(spinsAwarded);
+        }
+    }
+    
+    /**
+     * Display the retrigger visual effect ("+5 FREE SPINS" animation)
+     * Does NOT modify state - display only
+     * @param {Number} spinsAwarded - Number of spins to display
+     */
+    displayRetriggerEffect(spinsAwarded) {
+        // Show animated +N visual effect
+        try {
+            if (this.uiManager && this.uiManager.showFreeSpinsRetriggerAnimation) {
+                this.uiManager.showFreeSpinsRetriggerAnimation(spinsAwarded);
+            } else {
+                this.uiManager?.updateFreeSpinsDisplay?.();
+            }
+        } catch (_) {}
+        
+        // Play bonus sound
+        window.SafeSound.play(this, 'bonus');
+        
+        // Update display
+        this.uiManager?.updateFreeSpinsDisplay?.();
     }
     
     async animateServerCascades(cascades) {

@@ -18,6 +18,7 @@
 
 const GameEngine = require('../game/gameEngine');
 const StateManager = require('../game/stateManager');
+const { getStateManager } = require('../game/stateManager');
 const AntiCheat = require('../game/antiCheat');
 const AuditLogger = require('../game/auditLogger');
 const walletLedger = require('../services/walletLedger');
@@ -30,7 +31,8 @@ const { saveSpinResult } = require('../db/supabaseClient');
 class GameController {
   constructor() {
     this.gameEngine = new GameEngine();
-    this.stateManager = new StateManager();
+    // Use singleton StateManager for shared cache across the application
+    this.stateManager = getStateManager();
     this.antiCheat = new AntiCheat();
     this.auditLogger = new AuditLogger();
     this.pendingSpinResults = new Map();
@@ -57,10 +59,9 @@ class GameController {
       const {
         betAmount = 1.00,
         quickSpinMode = false,
-        bonusMode = false,
-        freeSpinsActive: clientFreeSpinsActive = false,
-        freeSpinsRemaining: clientFreeSpinsRemaining = 0,
-        accumulatedMultiplier: clientAccumulatedMultiplier = 1
+        bonusMode = false
+        // NOTE: Client-sent freeSpinsActive, freeSpinsRemaining, accumulatedMultiplier are IGNORED
+        // Server is the SOLE AUTHORITY on free spins state and multipliers
       } = req.body;
       const normalizedBetAmount = Number.isFinite(betAmount) ? betAmount : (parseFloat(betAmount) || 0);
       const clientRequestId = req.body.clientRequestId || req.body.requestId || null;
@@ -245,17 +246,12 @@ class GameController {
         // SAVE ORIGINAL VALUE before modification (critical for state update logic)
         const originalServerFreeSpinsActive = serverFreeSpinsActive;
 
-        console.log('[GameController] Step 3: Game state loaded, mode:', gameState?.game_mode, 'free spins:', serverFreeSpinsRemaining, 'multiplier:', serverAccumulatedMultiplier);
-        console.log('[GameController] Client claims: freeSpinsActive:', clientFreeSpinsActive, 'freeSpinsRemaining:', clientFreeSpinsRemaining, 'accumulatedMultiplier:', clientAccumulatedMultiplier);
-
-        // CRITICAL FIX: Handle free spins purchase case and ending spins
-        // If client says it's in free spins mode but server doesn't know, trust the client
-        // This happens when: 1) free spins are purchased, or 2) client is on ending spin (remaining=0)
-        if (clientFreeSpinsActive && !originalServerFreeSpinsActive) {
-          console.log('[GameController] ⚠️ Client in free spins but server is not - using client values (FREE SPINS PURCHASE or ENDING SPIN), remaining:', clientFreeSpinsRemaining, 'multiplier:', clientAccumulatedMultiplier);
-          serverFreeSpinsActive = true;
-          // Don't override serverFreeSpinsRemaining and serverAccumulatedMultiplier yet - let the state update logic handle it
-        }
+        console.log('[GameController] Step 3: Game state loaded (SERVER AUTHORITATIVE):', {
+          mode: gameState?.game_mode,
+          freeSpinsRemaining: serverFreeSpinsRemaining,
+          accumulatedMultiplier: serverAccumulatedMultiplier
+        });
+        // NOTE: We no longer log or use client-sent free spins values - server is authoritative
 
         // Process bet transaction using wallet ledger (skip during free spins or demo)
         let betTransaction = null;
@@ -348,17 +344,10 @@ class GameController {
         }
 
         // Process spin with game engine
-        // CRITICAL: Trust server state first! Only use client values when server is out of sync.
-        // If server says we're in free spins, use server values.
-        // If client says we're in free spins but server doesn't know, trust client (including when remaining=0, which is the ending spin).
-        const clientClaimsFreeSpins = Boolean(clientFreeSpinsActive) || (Number(clientFreeSpinsRemaining) > 0);
-        const effectiveFreeSpinsActive = serverFreeSpinsActive || (clientClaimsFreeSpins && !serverFreeSpinsActive);
-        const effectiveFreeSpinsRemaining = serverFreeSpinsActive
-          ? serverFreeSpinsRemaining  // Trust server when it knows we're in free spins
-          : (clientClaimsFreeSpins ? Math.max(0, clientFreeSpinsRemaining) : 0);  // Trust client even if remaining=0 (ending spin)
-        const effectiveAccumulatedMultiplier = serverFreeSpinsActive
-          ? serverAccumulatedMultiplier  // Trust server when it knows we're in free spins
-          : (clientClaimsFreeSpins && clientAccumulatedMultiplier >= 1 ? clientAccumulatedMultiplier : 1);  // Trust client's accumulated multiplier
+        // SERVER IS THE SOLE AUTHORITY - use only server state, never client values
+        const effectiveFreeSpinsActive = serverFreeSpinsActive;
+        const effectiveFreeSpinsRemaining = serverFreeSpinsRemaining;
+        const effectiveAccumulatedMultiplier = serverAccumulatedMultiplier;
 
         const spinRequest = {
           betAmount: normalizedBetAmount,
@@ -372,7 +361,11 @@ class GameController {
           spinId
         };
 
-        console.log('[GameController] Spin request to engine - freeSpinsActive:', effectiveFreeSpinsActive, 'remaining:', effectiveFreeSpinsRemaining, 'multiplier:', effectiveAccumulatedMultiplier);
+        console.log('[GameController] Spin request to engine (SERVER STATE):', {
+          freeSpinsActive: effectiveFreeSpinsActive,
+          freeSpinsRemaining: effectiveFreeSpinsRemaining,
+          accumulatedMultiplier: effectiveAccumulatedMultiplier
+        });
 
         console.log('[GameController] Step 6: About to call gameEngine.processCompleteSpin');
         const spinResult = await this.gameEngine.processCompleteSpin(spinRequest);
@@ -508,35 +501,40 @@ class GameController {
           const { supabaseAdmin } = require('../db/supabaseClient');
 
           // CRITICAL: Calculate game mode and free spins like stateManager does
-          // Mimic stateManager.calculateStateUpdates() logic exactly
+          // SERVER IS AUTHORITATIVE - use only database state, never client values
           let newGameMode = gameState.game_mode || 'base';
           let newFreeSpinsRemaining = gameState.free_spins_remaining || 0;
           let newAccumulatedMultiplier = gameState.accumulated_multiplier || 1;
 
           // Step 1: Handle currently in free spins (decrement)
-          // Use effectiveFreeSpinsActive to handle purchase case where client is in FS but server doesn't know
+          // Use server state ONLY
           if (effectiveFreeSpinsActive) {
-            // If this is a purchase or ending spin (client says FS but server doesn't), start with client's count
-            // CRITICAL: Use originalServerFreeSpinsActive (before modification) to detect client-ahead case
-            const currentCount = clientFreeSpinsActive && !originalServerFreeSpinsActive
-              ? Math.max(0, clientFreeSpinsRemaining)  // Trust client even if 0 (ending spin)
-              : (gameState.free_spins_remaining || 0);
-            newFreeSpinsRemaining = Math.max(0, currentCount - 1);
+            newFreeSpinsRemaining = Math.max(0, (gameState.free_spins_remaining || 0) - 1);
             newGameMode = 'free_spins'; // Ensure mode is set
           }
 
-          // Step 2: Handle free spins trigger (overrides decrement)
+          // Step 2: Handle free spins trigger or retrigger
           if (spinResult.features?.free_spins) {
+            const isRetrigger = spinResult.features.free_spins.retrigger === true;
             newGameMode = 'free_spins';
+            // The count from gameEngine already includes remaining + awarded for retriggers
             newFreeSpinsRemaining = spinResult.features.free_spins.count;
-            newAccumulatedMultiplier = spinResult.features.free_spins.multiplier || 1.00;
-          }
-
-          // Step 2.5: Handle free spins RETRIGGER (add to remaining count)
-          // CRITICAL: This must happen BEFORE checking if free spins ended!
-          if (spinResult.bonusFeatures?.freeSpinsRetriggered && spinResult.bonusFeatures?.freeSpinsAwarded) {
-            newFreeSpinsRemaining += spinResult.bonusFeatures.freeSpinsAwarded;
-            console.log('[GameController] 🎰 FREE SPINS RETRIGGERED! Added', spinResult.bonusFeatures.freeSpinsAwarded, 'spins, new total:', newFreeSpinsRemaining);
+            
+            if (isRetrigger) {
+              // RETRIGGER: Keep accumulated multiplier, don't reset
+              console.log('[GameController] 🎰 FREE SPINS RETRIGGERED!', {
+                spinsAwarded: spinResult.features.free_spins.spinsAwarded,
+                newTotal: newFreeSpinsRemaining,
+                keepingMultiplier: newAccumulatedMultiplier
+              });
+            } else {
+              // NEW TRIGGER: Reset multiplier to base
+              newAccumulatedMultiplier = spinResult.features.free_spins.multiplier || 1.00;
+              console.log('[GameController] 🎰 NEW FREE SPINS TRIGGERED!', {
+                spinsAwarded: spinResult.features.free_spins.count,
+                startingMultiplier: newAccumulatedMultiplier
+              });
+            }
           }
 
           // Step 3: Update accumulated multiplier if in free spins and new multipliers were awarded
@@ -795,7 +793,11 @@ class GameController {
           : 0;
         const nextGameMode = stateResult.gameState.game_mode;
         const freeSpinsActiveNext = nextGameMode === 'free_spins';
-        const freeSpinsEnded = effectiveFreeSpinsActive && !freeSpinsActiveNext;
+        
+        // CRITICAL: Free spins did NOT end if we retriggered!
+        // Even if the state temporarily showed base mode before retrigger was processed,
+        // the final state after retrigger should show free_spins mode.
+        const freeSpinsEnded = effectiveFreeSpinsActive && !freeSpinsActiveNext && !freeSpinsRetriggered;
 
         // CRITICAL: The accumulated multiplier to display is the one USED for this spin,
         // not the one saved for the next spin! If free spins just ended, the saved state
@@ -1415,11 +1417,8 @@ class GameController {
       errors.push('Bet amount exceeds maximum limit');
     }
 
-    // Validate multiplier
-    const multiplier = parseFloat(requestData.accumulatedMultiplier || 1);
-    if (isNaN(multiplier) || multiplier < 1 || multiplier > 5000) {
-      errors.push('Invalid accumulated multiplier: must be between 1 and 5000');
-    }
+    // NOTE: We do NOT validate client-sent accumulatedMultiplier because server is authoritative
+    // The server tracks multipliers internally - client values are ignored
 
     // Validate user status
     if (user.status !== 'active') {

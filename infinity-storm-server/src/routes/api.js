@@ -586,7 +586,99 @@ router.post('/buy-feature',
       if (!isDemo) {
         const { supabaseAdmin } = require('../db/supabaseClient');
 
-        // Create transaction record
+        // CRITICAL: Update game state to free spins mode FIRST (before transaction record)
+        // This MUST succeed for the purchase to be valid
+        const gameStateUpdate = {
+          player_id: playerId,
+          game_mode: 'free_spins',
+          free_spins_remaining: FREE_SPINS_COUNT,
+          accumulated_multiplier: 1.00,
+          state_data: {
+            purchase_timestamp: new Date().toISOString(),
+            purchase_cost: cost
+          },
+          updated_at: new Date().toISOString()
+        };
+
+        // Try update first, then insert if no rows affected (manual upsert)
+        const { data: updateResult, error: stateUpdateError } = await supabaseAdmin
+          .from('game_states')
+          .update(gameStateUpdate)
+          .eq('player_id', playerId)
+          .select();
+
+        let stateUpdateSuccess = false;
+        
+        if (stateUpdateError) {
+          logger.error('Failed to update game state for purchase', {
+            playerId,
+            error: stateUpdateError.message
+          });
+        } else if (!updateResult || updateResult.length === 0) {
+          // No existing row - insert new one
+          const { error: stateInsertError } = await supabaseAdmin
+            .from('game_states')
+            .insert(gameStateUpdate);
+
+          if (stateInsertError) {
+            logger.error('Failed to insert game state for purchase', {
+              playerId,
+              error: stateInsertError.message
+            });
+          } else {
+            stateUpdateSuccess = true;
+            logger.info('Created new game state for free spins purchase', { playerId });
+          }
+        } else {
+          stateUpdateSuccess = true;
+          logger.info('Updated existing game state for free spins purchase', { playerId });
+        }
+
+        // CRITICAL: Invalidate ALL caches (Redis + in-memory) after successful state update
+        if (stateUpdateSuccess) {
+          try {
+            // Use the singleton StateManager to invalidate both Redis and in-memory cache
+            const { getStateManager } = require('../game/stateManager');
+            const stateManager = getStateManager();
+            await stateManager.invalidateStateCache(playerId);
+            logger.info('Invalidated all caches for player after purchase', { playerId });
+          } catch (cacheError) {
+            logger.warn('Failed to invalidate caches after purchase (non-critical)', {
+              playerId,
+              error: cacheError.message
+            });
+          }
+        }
+
+        // CRITICAL: If game state update failed, REFUND the balance and fail the request
+        if (!stateUpdateSuccess) {
+          logger.error('CRITICAL: Game state update failed - refunding balance', {
+            playerId,
+            cost,
+            originalBalance: playerBalance
+          });
+
+          // Refund the balance
+          const { error: refundError } = await supabaseAdmin
+            .from('players')
+            .update({ credits: playerBalance })
+            .eq('id', playerId);
+
+          if (refundError) {
+            logger.error('CRITICAL: Failed to refund balance after game state failure', {
+              playerId,
+              error: refundError.message
+            });
+          }
+
+          return res.status(500).json({
+            success: false,
+            error: 'GAME_STATE_UPDATE_FAILED',
+            message: 'Failed to enter free spins mode. Your balance has been refunded.'
+          });
+        }
+
+        // Create transaction record (non-critical - log but don't fail)
         const { error: txError } = await supabaseAdmin
           .from('transactions')
           .insert({
@@ -600,58 +692,10 @@ router.post('/buy-feature',
           });
 
         if (txError) {
-          logger.warn('Failed to record purchase transaction', {
+          logger.warn('Failed to record purchase transaction (non-critical)', {
             playerId,
             error: txError.message
           });
-        }
-
-        // Update game state to free spins mode
-        const { data: existingState } = await supabaseAdmin
-          .from('game_states')
-          .select('*')
-          .eq('player_id', playerId)
-          .single();
-
-        const stateData = existingState?.state_data || {};
-        const gameStateUpdate = {
-          player_id: playerId,
-          game_mode: 'free_spins',
-          free_spins_remaining: FREE_SPINS_COUNT,
-          accumulated_multiplier: 1.00,
-          state_data: {
-            ...stateData,
-            purchase_timestamp: new Date().toISOString(),
-            purchase_cost: cost
-          },
-          updated_at: new Date().toISOString()
-        };
-
-        if (existingState) {
-          // Update existing state
-          const { error: stateUpdateError } = await supabaseAdmin
-            .from('game_states')
-            .update(gameStateUpdate)
-            .eq('player_id', playerId);
-
-          if (stateUpdateError) {
-            logger.error('Failed to update game state for purchase', {
-              playerId,
-              error: stateUpdateError.message
-            });
-          }
-        } else {
-          // Insert new state
-          const { error: stateInsertError } = await supabaseAdmin
-            .from('game_states')
-            .insert(gameStateUpdate);
-
-          if (stateInsertError) {
-            logger.error('Failed to insert game state for purchase', {
-              playerId,
-              error: stateInsertError.message
-            });
-          }
         }
       } else {
         logger.info('🎮 [DEMO PURCHASE] Skipping database transaction/state recording');
