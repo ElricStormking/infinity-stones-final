@@ -6,17 +6,34 @@
  * Handles symbol removal, dropping physics simulation, and new symbol generation
  * with identical timing and behavior to client GridManager cascade logic.
  *
+ * REEL STRIPS MODE: Uses industry-standard reel strips for replacement symbols
+ * LEGACY MODE: Uses weighted random selection (fallback)
+ *
  * CRITICAL: Must produce identical grid states and timing as client implementation.
  */
 
 const { getRNG } = require('./rng');
 const SymbolDistribution = require('./symbolDistribution');
+const { getReelStripGenerator, STRIP_VERSION } = require('./reelStripGenerator');
+
+// Feature flag for reel strips (default: enabled)
+const USE_REEL_STRIPS = process.env.USE_REEL_STRIPS !== 'false';
 
 class CascadeProcessor {
   constructor(gameConfig, rng = null) {
     this.gameConfig = gameConfig;
     this.rng = rng || getRNG();
     this.symbolDistribution = new SymbolDistribution(); // Use single source of truth
+    this.useReelStrips = USE_REEL_STRIPS;
+    
+    // Initialize reel strip generator if enabled
+    if (this.useReelStrips) {
+      this.reelStripGenerator = getReelStripGenerator({
+        rng: this.rng,
+        rows: gameConfig.GRID_ROWS,
+        cols: gameConfig.GRID_COLS
+      });
+    }
 
     // Timing constants (identical to client GameConfig.js)
     this.timing = {
@@ -34,13 +51,15 @@ class CascadeProcessor {
       symbolsGenerated: 0,
       averageCascadeDuration: 0,
       maxSymbolsInCascade: 0,
-      initialized: Date.now()
+      initialized: Date.now(),
+      reelStripsMode: this.useReelStrips
     };
 
     this.logAuditEvent('CASCADE_PROCESSOR_INITIALIZED', {
       grid_dimensions: `${gameConfig.GRID_COLS}x${gameConfig.GRID_ROWS}`,
       cascade_speed: this.timing.CASCADE_SPEED,
-      drop_delay_per_row: this.timing.DROP_DELAY_PER_ROW
+      drop_delay_per_row: this.timing.DROP_DELAY_PER_ROW,
+      reel_strips_mode: this.useReelStrips
     });
   }
 
@@ -232,11 +251,17 @@ class CascadeProcessor {
 
   /**
      * Fill empty spaces with new symbols
+     * 
+     * REEL STRIPS MODE: Uses column-specific reel strips (industry standard)
+     * LEGACY MODE: Uses weighted random selection
+     * 
      * @param {Array<Array<string>>} grid - Grid to fill
      * @param {number} cascadeStep - Current cascade step for RNG seeding
+     * @param {string} cascadeSeed - Optional seed for deterministic results
+     * @param {boolean} freeSpinsMode - Whether in free spins mode
      * @returns {Object} Fill result with new symbols data
      */
-  async fillEmptySpaces(grid, cascadeStep, cascadeSeed = null) {
+  async fillEmptySpaces(grid, cascadeStep, cascadeSeed = null, freeSpinsMode = false) {
     const newSymbols = [];
     let newSymbolCount = 0;
 
@@ -249,7 +274,30 @@ class CascadeProcessor {
     for (let row = 0; row < this.gameConfig.GRID_ROWS; row++) {
       for (let col = 0; col < this.gameConfig.GRID_COLS; col++) {
         if (!grid[col][row]) {
-          const newSymbol = this.getRandomSymbol(cascadeRNG);
+          let newSymbol;
+          let stripPosition = null;
+          
+          // ================================================================
+          // REEL STRIPS MODE (Industry Standard)
+          // ================================================================
+          if (this.useReelStrips && this.reelStripGenerator) {
+            // Generate replacement symbol from column's reel strip
+            const positionSeed = `${seededHex}_cascade${cascadeStep}_${col}_${row}`;
+            const replacement = this.reelStripGenerator.generateReplacementSymbol(
+              col, 
+              freeSpinsMode, 
+              positionSeed
+            );
+            newSymbol = replacement.symbol;
+            stripPosition = replacement.stripPosition;
+          } 
+          // ================================================================
+          // LEGACY MODE (Weighted Random)
+          // ================================================================
+          else {
+            newSymbol = this.getRandomSymbol(cascadeRNG, freeSpinsMode);
+          }
+          
           grid[col][row] = newSymbol;
 
           // Calculate how many empty rows are above this position
@@ -277,7 +325,11 @@ class CascadeProcessor {
             dropTime,
             emptyRowsAbove,
             isNewSymbol: true,
-            rngSeed: seededHex
+            rngSeed: seededHex,
+            // Reel strip audit data
+            stripPosition: stripPosition,
+            stripVersion: this.useReelStrips ? STRIP_VERSION : null,
+            generationMethod: this.useReelStrips ? 'reel_strips' : 'weighted_random'
           };
 
           newSymbols.push(newSymbolData);
@@ -288,7 +340,9 @@ class CascadeProcessor {
 
     this.logAuditEvent('EMPTY_SPACES_FILLED', {
       new_symbols_count: newSymbolCount,
-      symbols_generated: newSymbols.map(s => `${s.position.col},${s.position.row}:${s.symbol}`)
+      symbols_generated: newSymbols.map(s => `${s.position.col},${s.position.row}:${s.symbol}`),
+      generation_method: this.useReelStrips ? 'reel_strips' : 'weighted_random',
+      free_spins_mode: freeSpinsMode
     });
 
     return {

@@ -4,15 +4,25 @@
  * Task 4.1: Implement server-side RNG - Grid Generation Component
  *
  * This implements symbol grid generation using:
+ * - Industry-standard reel strips (when USE_REEL_STRIPS=true)
+ * - Fallback to weighted random selection (legacy mode)
  * - Cryptographically secure RNG from rng.js
- * - Weighted probability tables from GameConfig
  * - 96.5% RTP maintenance through proper distribution
  * - Complete audit trail for compliance
  * - Deterministic results from seeds for replay/audit
+ * 
+ * REEL STRIPS MODE (default):
+ * - Only 6 RNG calls per grid (one per column)
+ * - Full reproducibility from stop positions + strip version
+ * - Industry-standard audit compliance
  */
 
 const { getRNG } = require('./rng');
 const SymbolDistribution = require('./symbolDistribution');
+const { getReelStripGenerator, STRIP_VERSION } = require('./reelStripGenerator');
+
+// Feature flag for reel strips (default: enabled)
+const USE_REEL_STRIPS = process.env.USE_REEL_STRIPS !== 'false';
 
 const MIN_MATCH_COUNT = 8;
 
@@ -32,12 +42,27 @@ class GridGenerator {
       // Production defaults: do NOT force winning clusters
       minClustersPerGrid: 0,
       clusterInjection: false,
+      // Reel strips mode (industry standard)
+      useReelStrips: USE_REEL_STRIPS,
       ...options
     };
 
     // Initialize RNG and symbol distribution
     this.rng = getRNG({ auditLogging: this.options.auditLogging });
     this.symbolDistribution = new SymbolDistribution();
+    
+    // Initialize reel strip generator if enabled
+    if (this.options.useReelStrips) {
+      this.reelStripGenerator = getReelStripGenerator({
+        rng: this.rng,
+        rows: this.options.rows,
+        cols: this.options.cols,
+        auditLogging: this.options.auditLogging
+      });
+      console.log(`[GridGenerator] Using REEL STRIPS mode (v${STRIP_VERSION}) - Industry standard RNG`);
+    } else {
+      console.log('[GridGenerator] Using LEGACY weighted random mode');
+    }
 
     // Grid generation statistics
     this.stats = {
@@ -45,7 +70,8 @@ class GridGenerator {
       symbolsGenerated: 0,
       seedsUsed: 0,
       lastGenerationTime: null,
-      distributionStats: {}
+      distributionStats: {},
+      reelStripsMode: this.options.useReelStrips
     };
 
     this.initializeDistributionTracking();
@@ -107,9 +133,10 @@ class GridGenerator {
     });
 
     // Generate the grid
-    const { grid, symbolCounts, metadata: cascadeMetadata } = this.generateCascadeReadyGrid(rng, {
+    const { grid, symbolCounts, metadata: cascadeMetadata, stopPositions, stripVersion } = this.generateCascadeReadyGrid(rng, {
       freeSpinsMode,
-      accumulatedMultiplier
+      accumulatedMultiplier,
+      seed
     });
 
     const endTime = Date.now();
@@ -142,7 +169,13 @@ class GridGenerator {
         total_symbols: this.options.cols * this.options.rows,
         generated_at: startTime,
         validation,
-        cascade_metadata: cascadeMetadata
+        cascade_metadata: cascadeMetadata,
+        // Reel strips audit data (for spin reconstruction)
+        reel_strips: this.options.useReelStrips ? {
+          stop_positions: stopPositions,
+          strip_version: stripVersion,
+          generation_method: 'reel_strips'
+        } : null
       },
       statistics: this.getGenerationStatistics()
     };
@@ -171,36 +204,95 @@ class GridGenerator {
   /**
      * Generate a cascade-ready grid by first creating a weighted layout
      * and then enforcing strong cluster coverage using deterministic heuristics.
+     * 
+     * REEL STRIPS MODE: Uses industry-standard reel strips (6 RNG calls)
+     * LEGACY MODE: Uses weighted random per-cell (30 RNG calls)
+     * 
      * @param {Function} rng
      * @param {Object} context
-     * @returns {{grid:Array<Array<string>>,symbolCounts:Object,metadata:Object}}
+     * @returns {{grid:Array<Array<string>>,symbolCounts:Object,metadata:Object,stopPositions?:Array}}
      */
   generateCascadeReadyGrid(rng, context = {}) {
-    const grid = this.createEmptyGrid();
-    const symbolCounts = {};
+    let grid;
+    let symbolCounts = {};
     const originalCounts = {};
+    let stopPositions = null;
+    let stripVersion = null;
 
-    // Phase 1: seeded weighted fill
-    for (let col = 0; col < this.options.cols; col++) {
-      for (let row = 0; row < this.options.rows; row++) {
-        const symbol = this.generateSymbol(rng, {
-          position: [col, row],
-          freeSpinsMode: context.freeSpinsMode,
-          accumulatedMultiplier: context.accumulatedMultiplier
-        });
-
-        grid[col][row] = symbol;
-        symbolCounts[symbol] = (symbolCounts[symbol] || 0) + 1;
-        originalCounts[symbol] = (originalCounts[symbol] || 0) + 1;
-        this.stats.symbolsGenerated++;
-
+    // ========================================================================
+    // REEL STRIPS MODE (Industry Standard)
+    // ========================================================================
+    if (this.options.useReelStrips && this.reelStripGenerator) {
+      // Generate grid from reel strips - only 6 RNG calls!
+      const stripResult = this.reelStripGenerator.generateInitialGrid({
+        freeSpinsMode: context.freeSpinsMode || false,
+        seed: context.seed || null
+      });
+      
+      grid = stripResult.grid;
+      symbolCounts = stripResult.symbolCounts;
+      stopPositions = stripResult.stopPositions;
+      stripVersion = stripResult.stripVersion;
+      
+      // Copy counts for tracking
+      for (const [symbol, count] of Object.entries(symbolCounts)) {
+        originalCounts[symbol] = count;
+        this.stats.symbolsGenerated += count;
         if (this.stats.distributionStats[symbol]) {
-          this.stats.distributionStats[symbol].count++;
+          this.stats.distributionStats[symbol].count += count;
+        }
+      }
+      
+      this.rng.emit('audit_event', {
+        timestamp: Date.now(),
+        event: 'GRID_GENERATED_REEL_STRIPS',
+        data: {
+          stopPositions,
+          stripVersion,
+          freeSpinsMode: context.freeSpinsMode,
+          rngCalls: 6
+        }
+      });
+    } 
+    // ========================================================================
+    // LEGACY MODE (Weighted Random Per-Cell)
+    // ========================================================================
+    else {
+      grid = this.createEmptyGrid();
+
+      // Phase 1: seeded weighted fill (30 RNG calls)
+      for (let col = 0; col < this.options.cols; col++) {
+        for (let row = 0; row < this.options.rows; row++) {
+          const symbol = this.generateSymbol(rng, {
+            position: [col, row],
+            freeSpinsMode: context.freeSpinsMode,
+            accumulatedMultiplier: context.accumulatedMultiplier
+          });
+
+          grid[col][row] = symbol;
+          symbolCounts[symbol] = (symbolCounts[symbol] || 0) + 1;
+          originalCounts[symbol] = (originalCounts[symbol] || 0) + 1;
+          this.stats.symbolsGenerated++;
+
+          if (this.stats.distributionStats[symbol]) {
+            this.stats.distributionStats[symbol].count++;
+          }
         }
       }
     }
 
     const metadata = this.enforceCascadeClusters(grid, rng, context);
+    
+    // Add reel strip info to metadata if applicable
+    if (stopPositions) {
+      metadata.reelStrips = {
+        stopPositions,
+        stripVersion,
+        generationMethod: 'reel_strips'
+      };
+    } else {
+      metadata.generationMethod = 'weighted_random';
+    }
 
     // CRITICAL: Prevent 4+ scatters on winning grids (UI overlap fix)
     // If grid has wins, cap scatters at 3 to avoid win celebration + free spins trigger overlap
@@ -210,7 +302,7 @@ class GridGenerator {
     const finalCounts = this.countSymbols(grid);
     this.applySymbolCountDiff(originalCounts, finalCounts);
 
-    return { grid, symbolCounts: finalCounts, metadata };
+    return { grid, symbolCounts: finalCounts, metadata, stopPositions, stripVersion };
   }
 
   /**
